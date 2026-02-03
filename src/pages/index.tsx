@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useState, useRef } from "react";
 import VrmViewer from "@/components/vrmViewer";
 import { ViewerContext } from "@/features/vrmViewer/viewerContext";
 import {
@@ -20,6 +20,8 @@ import { ElevenLabsParam, DEFAULT_ELEVEN_LABS_PARAM } from "@/features/constants
 import { buildUrl } from "@/utils/buildUrl";
 import { websocketService } from '../services/websocketService';
 import { MessageMiddleOut } from "@/features/messages/messageMiddleOut";
+import { AvatarClient, CommandMessage, SpeakCommand, ExpressionCommand, IdleCommand } from "@/lib/avatarClient";
+import { VRMExpressionPresetName } from "@pixiv/three-vrm";
 
 const m_plus_2 = M_PLUS_2({
   variable: "--font-m-plus-2",
@@ -61,6 +63,10 @@ export default function Home() {
     }
     return '';
   });
+  
+  // WebSocket avatar control client
+  const avatarClient = useRef<AvatarClient | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
 
   useEffect(() => {
     if (window.localStorage.getItem("chatVRMParams")) {
@@ -317,9 +323,150 @@ export default function Home() {
     localStorage.setItem('openRouterKey', newKey);
   };
 
+  // Initialize WebSocket avatar control client
+  useEffect(() => {
+    if (!avatarClient.current && viewer) {
+      console.log('🤖 Initializing Avatar Control Client...');
+      const client = new AvatarClient('ws://localhost:8765');
+      
+      // Set up command handlers
+      client.onCommand(async (command: CommandMessage) => {
+        console.log('📥 Received command:', command.type);
+        
+        try {
+          switch (command.type) {
+            case 'speak':
+            case 'startSpeaking': {
+              const cmd = command as any;
+              const text = cmd.text || '';
+              const emotion = cmd.emotion || 'neutral';
+              const audioUrl = cmd.audioUrl || '';
+              console.log('🎤 Speaking:', text, 'with emotion:', emotion);
+              
+              // Convert emotion to screenplay format
+              const screenplayText = `[${emotion}] ${text}`;
+              const screenplay = textsToScreenplay([screenplayText], koeiroParam)[0];
+              
+              // Play audio from URL if provided
+              if (audioUrl) {
+                try {
+                  // Audio URL from server is relative, make it absolute
+                  const fullUrl = audioUrl.startsWith('http') ? audioUrl : `http://localhost:8766${audioUrl}`;
+                  console.log('🔊 Fetching audio from:', fullUrl);
+                  const response = await fetch(fullUrl);
+                  const audioBuffer = await response.arrayBuffer();
+                  await viewer.model?.speak(audioBuffer, screenplay);
+                } catch (error) {
+                  console.error('Failed to load audio from URL:', error);
+                  await viewer.model?.speak(null, screenplay);
+                }
+              } else {
+                await viewer.model?.speak(null, screenplay);
+              }
+              break;
+            }
+            
+            case 'setExpression':
+            case 'updateExpression': {
+              const cmd = command as any;
+              const exprName = cmd.name || cmd.expression || 'neutral';
+              console.log('😊 Setting expression:', exprName);
+              
+              // Map common emotion names to VRM preset names
+              const emotionMap: { [key: string]: VRMExpressionPresetName } = {
+                'neutral': 'neutral',
+                'happy': 'happy',
+                'angry': 'angry',
+                'sad': 'sad',
+                'relaxed': 'relaxed',
+                'surprised': 'surprised',
+              };
+              
+              const expression = emotionMap[exprName.toLowerCase()] || 'neutral';
+              viewer.model?.expressionController?.playEmotion(expression);
+              break;
+            }
+            
+            case 'setIdle': {
+              const cmd = command as IdleCommand;
+              console.log('💤 Setting idle mode:', cmd.mode);
+              // Idle animations are handled by the auto blink/look system
+              // We could extend this to control breathing animations
+              break;
+            }
+            
+            case 'getStatus': {
+              console.log('📊 Status requested');
+              client.send({
+                type: 'status',
+                connected: true,
+                speaking: isAISpeaking,
+                expression: 'neutral', // Could track current expression
+              });
+              break;
+            }
+            
+            case 'identifyAck':
+            case 'initialState':
+              // Server handshake messages - no action needed
+              break;
+
+            default:
+              console.warn('Unknown command type:', command.type);
+          }
+        } catch (error) {
+          console.error('Error handling command:', error);
+        }
+      });
+      
+      // Listen for connection state changes
+      client.onConnectionChange((connected) => {
+        console.log(`🔗 Connection state changed: ${connected}`);
+        setWsConnected(connected);
+      });
+      
+      // Connect to server
+      client.connect();
+      avatarClient.current = client;
+      
+      return () => {
+        client.disconnect();
+        avatarClient.current = null;
+      };
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewer]);
+
   return (
     <div className={`${m_plus_2.variable} ${montserrat.variable}`}>
       <Meta />
+      
+      {/* WebSocket connection status indicator */}
+      <div style={{
+        position: 'fixed',
+        top: '10px',
+        right: '10px',
+        padding: '8px 12px',
+        borderRadius: '4px',
+        backgroundColor: wsConnected ? '#10b981' : '#ef4444',
+        color: 'white',
+        fontSize: '12px',
+        fontWeight: 'bold',
+        zIndex: 1000,
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px'
+      }}>
+        <span style={{
+          width: '8px',
+          height: '8px',
+          borderRadius: '50%',
+          backgroundColor: 'white',
+          animation: wsConnected ? 'pulse 2s infinite' : 'none'
+        }} />
+        {wsConnected ? '🟢 Control Server Connected' : '🔴 Control Server Disconnected'}
+      </div>
+      
       <Introduction
         openAiKey={openAiKey}
         onChangeAiKey={setOpenAiKey}
